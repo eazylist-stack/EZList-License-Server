@@ -1,0 +1,158 @@
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const { Pool } = require("pg");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+const MAX_DEVICES = parseInt(process.env.MAX_DEVICES || "3", 10);
+
+async function verifyGumroadLicense(licenseKey) {
+  try {
+    const response = await axios.post(
+      "https://api.gumroad.com/v2/licenses/verify",
+      {
+        product_permalink: process.env.GUMROAD_PRODUCT_PERMALINK,
+        license_key: licenseKey
+      }
+    );
+
+    return response.data?.success === true;
+  } catch (err) {
+    console.error("Gumroad verification failed:", err.message);
+    return false;
+  }
+}
+
+app.get("/", (req, res) => {
+  res.send("EZList License Server Running");
+});
+
+app.post("/activate", async (req, res) => {
+  try {
+    const { licenseKey, deviceId } = req.body;
+
+    if (!licenseKey || !deviceId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing license key or device ID"
+      });
+    }
+
+    const valid = await verifyGumroadLicense(licenseKey);
+
+    if (!valid) {
+      return res.json({
+        success: false,
+        message: "Invalid license key"
+      });
+    }
+
+    const existing = await pool.query(
+      "SELECT * FROM activations WHERE license_key = $1",
+      [licenseKey]
+    );
+
+    const deviceExists = existing.rows.some(
+      row => row.device_id === deviceId
+    );
+
+    if (!deviceExists && existing.rows.length >= MAX_DEVICES) {
+      return res.json({
+        success: false,
+        message: "Device limit reached"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO activations (license_key, device_id)
+      VALUES ($1, $2)
+      ON CONFLICT (license_key, device_id)
+      DO UPDATE SET last_seen = NOW()
+      `,
+      [licenseKey, deviceId]
+    );
+
+    return res.json({
+      success: true
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server error"
+    });
+  }
+});
+
+app.post("/validate", async (req, res) => {
+  try {
+    const { licenseKey, deviceId } = req.body;
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM activations
+      WHERE license_key = $1
+      AND device_id = $2
+      `,
+      [licenseKey, deviceId]
+    );
+
+    return res.json({
+      valid: result.rows.length > 0
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      valid: false
+    });
+  }
+});
+
+app.post("/deactivate", async (req, res) => {
+  try {
+    const { licenseKey, deviceId } = req.body;
+
+    await pool.query(
+      `
+      DELETE FROM activations
+      WHERE license_key = $1
+      AND device_id = $2
+      `,
+      [licenseKey, deviceId]
+    );
+
+    return res.json({
+      success: true
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    return res.status(500).json({
+      success: false
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`EZList License Server running on port ${PORT}`);
+});
